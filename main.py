@@ -113,7 +113,7 @@ def get_ipv6_addresses(ifname: str) -> List[str]:
         with open("/proc/net/if_inet6", "r", encoding="utf-8") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 6 and parts[5] == ifname:
+                if len(parts) >= 8 and parts[5] == ifname:
                     addr_hex = parts[0]
                     addr_hex = addr_hex.zfill(32)
                     try:
@@ -144,6 +144,8 @@ def get_mac(ifname: str) -> Optional[str]:
     return read_text(f"/sys/class/net/{ifname}/address")
 
 def format_rate(value: float) -> str:
+    if value < 0:
+        value = 0.0
     units = ["B/s", "KiB/s", "MiB/s", "GiB/s"]
     idx = 0
     while value >= 1024 and idx < len(units) - 1:
@@ -152,6 +154,8 @@ def format_rate(value: float) -> str:
     return f"{value:.2f} {units[idx]}"
 
 def format_pps(value: float) -> str:
+    if value < 0:
+        value = 0.0
     if value >= 1_000_000:
         return f"{value / 1_000_000:.2f} Mpps"
     if value >= 1_000:
@@ -211,40 +215,38 @@ def print_row(
     if interval <= 0 or previous is None:
         rx_rate = tx_rate = rx_pps = tx_pps = 0.0
     else:
-        rx_rate = (int(current["rx_bytes"]) - int(previous["rx_bytes"])) / interval
-        tx_rate = (int(current["tx_bytes"]) - int(previous["tx_bytes"])) / interval
-        rx_pps = (int(current["rx_packets"]) - int(previous["rx_packets"])) / interval
-        tx_pps = (int(current["tx_packets"]) - int(previous["tx_packets"])) / interval
+        rx_rate = (current["rx_bytes"] - previous["rx_bytes"]) / interval
+        tx_rate = (current["tx_bytes"] - previous["tx_bytes"]) / interval
+        rx_pps = (current["rx_packets"] - previous["rx_packets"]) / interval
+        tx_pps = (current["tx_packets"] - previous["tx_packets"]) / interval
 
-    ipv4 = str(current["ipv4"] or "-")
-    state = str(current["operstate"])
+    ipv4 = current["ipv4"] or "-"
+    state = current["operstate"]
     color = get_state_color(state)
     reset = "\033[0m"
 
     print(
         f"{ifname:<12} {color}{state:<8}{reset} {ipv4:<16} "
-        f"{format_rate(max(rx_rate, 0.0)):>12} {format_rate(max(tx_rate, 0.0)):>12} "
-        f"{format_pps(max(rx_pps, 0.0)):>12} {format_pps(max(tx_pps, 0.0)):>12} "
-        f"{int(current['rx_errs']):>8} {int(current['tx_errs']):>8}"
+        f"{format_rate(rx_rate):>12} {format_rate(tx_rate):>12} "
+        f"{format_pps(rx_pps):>12} {format_pps(tx_pps):>12} "
+        f"{current['rx_errs']:>8} {current['tx_errs']:>8}"
     )
 
 def print_details(snapshot: Dict[str, InterfaceStats]) -> None:
     for ifname, info in snapshot.items():
         print(f"\n[{ifname}]")
         print(f"  state   : {info['operstate']}")
-        print(f"  carrier : {info['carrier'] or 'N/A'}")
-        speed = info['speed']
-        if speed is not None:
-            print(f"  speed   : {speed} Mb/s")
+        print(f"  carrier : {info['carrier'] if info['carrier'] is not None else 'N/A'}")
+        if info['speed'] is not None:
+            print(f"  speed   : {info['speed']} Mb/s")
         else:
             print(f"  speed   : N/A")
-        print(f"  duplex  : {info['duplex'] or 'N/A'}")
-        print(f"  mtu     : {info['mtu'] or 'N/A'}")
-        print(f"  mac     : {info['mac'] or 'N/A'}")
+        print(f"  duplex  : {info['duplex'] if info['duplex'] is not None else 'N/A'}")
+        print(f"  mtu     : {info['mtu'] if info['mtu'] is not None else 'N/A'}")
+        print(f"  mac     : {info['mac'] if info['mac'] is not None else 'N/A'}")
         print(f"  ipv4    : {info['ipv4'] or '-'}")
-        ipv6 = info["ipv6"]
-        if ipv6:
-            for idx, addr in enumerate(ipv6, 1):
+        if info['ipv6']:
+            for idx, addr in enumerate(info['ipv6'], 1):
                 print(f"  ipv6-{idx} : {addr}")
         else:
             print("  ipv6    : -")
@@ -270,18 +272,18 @@ def print_csv_row(
     if interval <= 0 or previous is None:
         rx_rate = tx_rate = rx_pps = tx_pps = 0.0
     else:
-        rx_rate = (int(current["rx_bytes"]) - int(previous["rx_bytes"])) / interval
-        tx_rate = (int(current["tx_bytes"]) - int(previous["tx_bytes"])) / interval
-        rx_pps = (int(current["rx_packets"]) - int(previous["rx_packets"])) / interval
-        tx_pps = (int(current["tx_packets"]) - int(previous["tx_packets"])) / interval
+        rx_rate = (current["rx_bytes"] - previous["rx_bytes"]) / interval
+        tx_rate = (current["tx_bytes"] - previous["tx_bytes"]) / interval
+        rx_pps = (current["rx_packets"] - previous["rx_packets"]) / interval
+        tx_pps = (current["tx_packets"] - previous["tx_packets"]) / interval
 
-    ipv4 = str(current["ipv4"] or "-")
-    state = str(current["operstate"])
+    ipv4 = current["ipv4"] or "-"
+    state = current["operstate"]
 
     print(f"{timestamp},{ifname},{state},{ipv4},"
-          f"{max(rx_rate, 0.0):.2f},{max(tx_rate, 0.0):.2f},"
-          f"{max(rx_pps, 0.0):.2f},{max(tx_pps, 0.0):.2f},"
-          f"{int(current['rx_errs'])},{int(current['tx_errs'])}")
+          f"{rx_rate:.2f},{tx_rate:.2f},"
+          f"{rx_pps:.2f},{tx_pps:.2f},"
+          f"{current['rx_errs']},{current['tx_errs']}")
 
 def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
