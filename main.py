@@ -271,7 +271,10 @@ def print_details(snapshot: Dict[str, InterfaceStats]) -> None:
         print(f"\n[{ifname}]")
         print(f"  state   : {info['operstate']}")
         print(f"  carrier : {info['carrier'] if info['carrier'] is not None else 'N/A'}")
-        print(f"  speed   : {info['speed']} Mb/s" if info["speed"] is not None else "  speed   : N/A")
+        if info["speed"] is not None:
+            print(f"  speed   : {info['speed']} Mb/s")
+        else:
+            print("  speed   : N/A")
         print(f"  duplex  : {info['duplex'] if info['duplex'] is not None else 'N/A'}")
         print(f"  mtu     : {info['mtu'] if info['mtu'] is not None else 'N/A'}")
         print(f"  mac     : {info['mac'] if info['mac'] is not None else 'N/A'}")
