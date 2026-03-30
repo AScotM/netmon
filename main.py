@@ -9,6 +9,7 @@ import argparse
 import signal
 import sys
 import logging
+import csv
 from typing import Dict, List, Optional, TypedDict
 
 
@@ -102,12 +103,17 @@ def parse_proc_net_dev() -> Dict[str, Dict[str, int]]:
 
 def get_ipv4_address(ifname: str) -> Optional[str]:
     try:
+        encoded = ifname.encode("utf-8")
+        if len(encoded) > 15:
+            logging.debug("Interface name too long for SIOCGIFADDR: %s", ifname)
+            return None
+
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             result = fcntl.ioctl(
                 s.fileno(),
                 0x8915,
-                struct.pack("256s", ifname[:15].encode("utf-8"))
+                struct.pack("256s", encoded)
             )
             return socket.inet_ntoa(result[20:24])
         except OSError as e:
@@ -186,15 +192,15 @@ def format_pps(value: float) -> str:
 def calculate_rates(
     current: InterfaceStats,
     previous: Optional[InterfaceStats],
-    interval: float
+    elapsed: float
 ) -> tuple[float, float, float, float]:
-    if interval <= 0 or previous is None:
+    if elapsed <= 0 or previous is None:
         return 0.0, 0.0, 0.0, 0.0
 
-    rx_rate = (current["rx_bytes"] - previous["rx_bytes"]) / interval
-    tx_rate = (current["tx_bytes"] - previous["tx_bytes"]) / interval
-    rx_pps = (current["rx_packets"] - previous["rx_packets"]) / interval
-    tx_pps = (current["tx_packets"] - previous["tx_packets"]) / interval
+    rx_rate = (current["rx_bytes"] - previous["rx_bytes"]) / elapsed
+    tx_rate = (current["tx_bytes"] - previous["tx_bytes"]) / elapsed
+    rx_pps = (current["rx_packets"] - previous["rx_packets"]) / elapsed
+    tx_pps = (current["tx_packets"] - previous["tx_packets"]) / elapsed
 
     return max(rx_rate, 0.0), max(tx_rate, 0.0), max(rx_pps, 0.0), max(tx_pps, 0.0)
 
@@ -226,15 +232,6 @@ def collect_snapshot(ifaces: List[str]) -> Dict[str, InterfaceStats]:
     return snapshot
 
 
-def print_header() -> None:
-    print(
-        f"{'IFACE':<12} {'STATE':<8} {'IPv4':<16} "
-        f"{'RX RATE':>12} {'TX RATE':>12} "
-        f"{'RX PPS':>12} {'TX PPS':>12} "
-        f"{'RX ERR':>8} {'TX ERR':>8}"
-    )
-
-
 def get_state_color(state: str) -> str:
     if not sys.stdout.isatty():
         return ""
@@ -242,79 +239,191 @@ def get_state_color(state: str) -> str:
         "up": "\033[92m",
         "down": "\033[91m",
         "unknown": "\033[93m",
+        "dormant": "\033[93m",
+        "lowerlayerdown": "\033[91m",
+        "notpresent": "\033[91m",
+        "testing": "\033[95m",
     }
     return colors.get(state, "\033[0m")
+
+
+def get_status_bar_color(snapshot: Dict[str, InterfaceStats]) -> str:
+    if not sys.stdout.isatty():
+        return ""
+    states = [info["operstate"] for info in snapshot.values()]
+    if any(state in {"down", "lowerlayerdown", "notpresent"} for state in states):
+        return "\033[91m"
+    if any(state in {"unknown", "dormant", "testing"} for state in states):
+        return "\033[93m"
+    return "\033[92m"
+
+
+def framed_line(width: int = 126) -> str:
+    return "┌" + "─" * (width - 2) + "┐"
+
+
+def framed_bottom(width: int = 126) -> str:
+    return "└" + "─" * (width - 2) + "┘"
+
+
+def framed_separator(width: int = 126) -> str:
+    return "├" + "─" * (width - 2) + "┤"
+
+
+def framed_text(text: str, width: int = 126) -> str:
+    inner = width - 4
+    if len(text) > inner:
+        text = text[:inner]
+    return f"│ {text.ljust(inner)} │"
+
+
+def print_banner(snapshot: Dict[str, InterfaceStats], iteration: int, elapsed: float, width: int = 126) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    color = get_status_bar_color(snapshot)
+    reset = "\033[0m" if color else ""
+    title = f"NET MONITOR  time={ts}  iteration={iteration}  elapsed={elapsed:.3f}s  interfaces={len(snapshot)}"
+    print(color + framed_line(width) + reset)
+    print(color + framed_text(title, width) + reset)
+    print(color + framed_separator(width) + reset)
+
+
+def print_header(width: int = 126) -> None:
+    header = (
+        f"{'IFACE':<12} {'STATE':<14} {'IPv4':<16} "
+        f"{'RX RATE':>12} {'TX RATE':>12} "
+        f"{'RX PPS':>12} {'TX PPS':>12} "
+        f"{'RX ERR':>8} {'TX ERR':>8} "
+        f"{'RX DRP':>8} {'TX DRP':>8}"
+    )
+    print(framed_text(header, width))
+    print(framed_separator(width))
 
 
 def print_row(
     ifname: str,
     current: InterfaceStats,
     previous: Optional[InterfaceStats],
-    interval: float
+    elapsed: float,
+    width: int = 126
 ) -> None:
-    rx_rate, tx_rate, rx_pps, tx_pps = calculate_rates(current, previous, interval)
+    rx_rate, tx_rate, rx_pps, tx_pps = calculate_rates(current, previous, elapsed)
     ipv4 = current["ipv4"] or "-"
     state = current["operstate"]
     color = get_state_color(state)
     reset = "\033[0m" if color else ""
 
-    print(
-        f"{ifname:<12} {color}{state:<8}{reset} {ipv4:<16} "
+    state_field = f"{color}{state:<14}{reset}" if color else f"{state:<14}"
+
+    row = (
+        f"{ifname:<12} {state_field} {ipv4:<16} "
         f"{format_rate(rx_rate):>12} {format_rate(tx_rate):>12} "
         f"{format_pps(rx_pps):>12} {format_pps(tx_pps):>12} "
-        f"{current['rx_errs']:>8} {current['tx_errs']:>8}"
+        f"{current['rx_errs']:>8} {current['tx_errs']:>8} "
+        f"{current['rx_drop']:>8} {current['tx_drop']:>8}"
     )
 
+    plain_prefix = f"{ifname:<12} "
+    if color:
+        visible_rest = (
+            f"{ipv4:<16} "
+            f"{format_rate(rx_rate):>12} {format_rate(tx_rate):>12} "
+            f"{format_pps(rx_pps):>12} {format_pps(tx_pps):>12} "
+            f"{current['rx_errs']:>8} {current['tx_errs']:>8} "
+            f"{current['rx_drop']:>8} {current['tx_drop']:>8}"
+        )
+        text = plain_prefix + state_field + " " + visible_rest
+    else:
+        text = row
 
-def print_details(snapshot: Dict[str, InterfaceStats]) -> None:
+    print(framed_text(text, width))
+
+
+def print_footer(width: int = 126) -> None:
+    print(framed_bottom(width))
+
+
+def print_details(snapshot: Dict[str, InterfaceStats], width: int = 90) -> None:
+    print(framed_line(width))
+    print(framed_text("INTERFACE DETAILS", width))
+    print(framed_separator(width))
+
     for ifname, info in snapshot.items():
-        print(f"\n[{ifname}]")
-        print(f"  state   : {info['operstate']}")
-        print(f"  carrier : {info['carrier'] if info['carrier'] is not None else 'N/A'}")
-        if info["speed"] is not None:
-            print(f"  speed   : {info['speed']} Mb/s")
-        else:
-            print("  speed   : N/A")
-        print(f"  duplex  : {info['duplex'] if info['duplex'] is not None else 'N/A'}")
-        print(f"  mtu     : {info['mtu'] if info['mtu'] is not None else 'N/A'}")
-        print(f"  mac     : {info['mac'] if info['mac'] is not None else 'N/A'}")
-        print(f"  ipv4    : {info['ipv4'] or '-'}")
+        print(framed_text(f"[{ifname}]", width))
+        print(framed_text(f"state    : {info['operstate']}", width))
+        print(framed_text(f"carrier  : {info['carrier'] if info['carrier'] is not None else 'N/A'}", width))
+        print(framed_text(f"speed    : {str(info['speed']) + ' Mb/s' if info['speed'] is not None else 'N/A'}", width))
+        print(framed_text(f"duplex   : {info['duplex'] if info['duplex'] is not None else 'N/A'}", width))
+        print(framed_text(f"mtu      : {info['mtu'] if info['mtu'] is not None else 'N/A'}", width))
+        print(framed_text(f"mac      : {info['mac'] if info['mac'] is not None else 'N/A'}", width))
+        print(framed_text(f"ipv4     : {info['ipv4'] or '-'}", width))
+
         if info["ipv6"]:
             for idx, addr in enumerate(info["ipv6"], 1):
-                print(f"  ipv6-{idx} : {addr}")
+                print(framed_text(f"ipv6-{idx:<2}  : {addr}", width))
         else:
-            print("  ipv6    : -")
-        print(f"  rx_bytes: {info['rx_bytes']}")
-        print(f"  tx_bytes: {info['tx_bytes']}")
-        print(f"  rx_pkts : {info['rx_packets']}")
-        print(f"  tx_pkts : {info['tx_packets']}")
-        print(f"  rx_errs : {info['rx_errs']}")
-        print(f"  tx_errs : {info['tx_errs']}")
-        print(f"  rx_drop : {info['rx_drop']}")
-        print(f"  tx_drop : {info['tx_drop']}")
+            print(framed_text("ipv6     : -", width))
+
+        print(framed_text(f"rx_bytes : {info['rx_bytes']}", width))
+        print(framed_text(f"tx_bytes : {info['tx_bytes']}", width))
+        print(framed_text(f"rx_pkts  : {info['rx_packets']}", width))
+        print(framed_text(f"tx_pkts  : {info['tx_packets']}", width))
+        print(framed_text(f"rx_errs  : {info['rx_errs']}", width))
+        print(framed_text(f"tx_errs  : {info['tx_errs']}", width))
+        print(framed_text(f"rx_drop  : {info['rx_drop']}", width))
+        print(framed_text(f"tx_drop  : {info['tx_drop']}", width))
+        print(framed_separator(width))
+
+    print(framed_bottom(width))
 
 
-def print_csv_header() -> None:
-    print("timestamp,iface,state,ipv4,rx_rate_bps,tx_rate_bps,rx_pps,tx_pps,rx_errs,tx_errs")
+def print_once(snapshot: Dict[str, InterfaceStats], width: int = 126) -> None:
+    print_banner(snapshot, iteration=0, elapsed=0.0, width=width)
+    print_header(width)
+    for ifname in snapshot:
+        print_row(ifname, snapshot[ifname], None, 0.0, width)
+    print_footer(width)
 
 
-def print_csv_row(
+def write_csv_header(writer: csv.writer) -> None:
+    writer.writerow([
+        "timestamp",
+        "iface",
+        "state",
+        "ipv4",
+        "rx_rate_Bps",
+        "tx_rate_Bps",
+        "rx_pps",
+        "tx_pps",
+        "rx_errs",
+        "tx_errs",
+        "rx_drop",
+        "tx_drop",
+    ])
+
+
+def write_csv_row(
+    writer: csv.writer,
     timestamp: float,
     ifname: str,
     current: InterfaceStats,
     previous: Optional[InterfaceStats],
-    interval: float
+    elapsed: float
 ) -> None:
-    rx_rate, tx_rate, rx_pps, tx_pps = calculate_rates(current, previous, interval)
-    ipv4 = current["ipv4"] or "-"
-    state = current["operstate"]
-
-    print(
-        f"{timestamp},{ifname},{state},{ipv4},"
-        f"{rx_rate:.2f},{tx_rate:.2f},"
-        f"{rx_pps:.2f},{tx_pps:.2f},"
-        f"{current['rx_errs']},{current['tx_errs']}"
-    )
+    rx_rate, tx_rate, rx_pps, tx_pps = calculate_rates(current, previous, elapsed)
+    writer.writerow([
+        f"{timestamp:.6f}",
+        ifname,
+        current["operstate"],
+        current["ipv4"] or "-",
+        f"{rx_rate:.2f}",
+        f"{tx_rate:.2f}",
+        f"{rx_pps:.2f}",
+        f"{tx_pps:.2f}",
+        current["rx_errs"],
+        current["tx_errs"],
+        current["rx_drop"],
+        current["tx_drop"],
+    ])
 
 
 def main() -> None:
@@ -328,6 +437,9 @@ def main() -> None:
     parser.add_argument("--details", action="store_true", help="show detailed interface info before monitoring")
     parser.add_argument("--csv", action="store_true", help="output in CSV format")
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
+    parser.add_argument("--once", action="store_true", help="show one snapshot and exit")
+    parser.add_argument("--no-header", action="store_true", help="suppress framed table headers in text mode")
+    parser.add_argument("--header-every", type=int, default=15, help="repeat framed header every N iterations in text mode")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -339,6 +451,9 @@ def main() -> None:
     if args.interval < min_interval:
         print(f"Warning: Interval too small, setting to {min_interval}s", file=sys.stderr)
         args.interval = min_interval
+
+    if args.header_every < 1:
+        args.header_every = 1
 
     available = set(get_interfaces())
     if args.iface:
@@ -355,33 +470,55 @@ def main() -> None:
         return
 
     previous = collect_snapshot(ifaces)
+    previous_time = time.time()
 
     if args.details:
         print_details(previous)
-        print()
+        if not args.once and not args.csv:
+            print()
 
+    if args.once:
+        if args.csv:
+            writer = csv.writer(sys.stdout)
+            write_csv_header(writer)
+            timestamp = time.time()
+            for ifname in ifaces:
+                write_csv_row(writer, timestamp, ifname, previous[ifname], None, 0.0)
+        else:
+            print_once(previous)
+        return
+
+    csv_writer = csv.writer(sys.stdout) if args.csv else None
     count = 0
+
     while running:
         time.sleep(args.interval)
 
         if not running:
             break
 
+        current_time = time.time()
         current = collect_snapshot(ifaces)
+        elapsed = current_time - previous_time
 
         if args.csv:
             if count == 0:
-                print_csv_header()
-            timestamp = time.time()
+                write_csv_header(csv_writer)
             for ifname in ifaces:
-                print_csv_row(timestamp, ifname, current[ifname], previous.get(ifname), args.interval)
+                write_csv_row(csv_writer, current_time, ifname, current[ifname], previous.get(ifname), elapsed)
         else:
-            print_header()
+            if not args.no_header and count % args.header_every == 0:
+                print_banner(current, iteration=count + 1, elapsed=elapsed, width=126)
+                print_header(126)
             for ifname in ifaces:
-                print_row(ifname, current[ifname], previous.get(ifname), args.interval)
-            print()
+                print_row(ifname, current[ifname], previous.get(ifname), elapsed, 126)
+            if not args.no_header:
+                print_footer(126)
+            else:
+                print()
 
         previous = current
+        previous_time = current_time
         count += 1
 
         if args.iterations > 0 and count >= args.iterations:
