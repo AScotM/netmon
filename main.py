@@ -10,7 +10,13 @@ import signal
 import sys
 import logging
 import csv
+import shutil
+import re
 from typing import Dict, List, Optional, TypedDict
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+running = True
 
 
 class InterfaceStats(TypedDict):
@@ -30,9 +36,6 @@ class InterfaceStats(TypedDict):
     tx_errs: int
     rx_drop: int
     tx_drop: int
-
-
-running = True
 
 
 def signal_handler(_sig, _frame) -> None:
@@ -171,7 +174,7 @@ def get_mac(ifname: str) -> Optional[str]:
 def format_rate(value: float) -> str:
     if value < 0:
         value = 0.0
-    units = ["B/s", "KiB/s", "MiB/s", "GiB/s"]
+    units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
     idx = 0
     while value >= 1024 and idx < len(units) - 1:
         value /= 1024.0
@@ -182,6 +185,8 @@ def format_rate(value: float) -> str:
 def format_pps(value: float) -> str:
     if value < 0:
         value = 0.0
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f} Gpps"
     if value >= 1_000_000:
         return f"{value / 1_000_000:.2f} Mpps"
     if value >= 1_000:
@@ -244,7 +249,7 @@ def get_state_color(state: str) -> str:
         "notpresent": "\033[91m",
         "testing": "\033[95m",
     }
-    return colors.get(state, "\033[0m")
+    return colors.get(state, "")
 
 
 def get_status_bar_color(snapshot: Dict[str, InterfaceStats]) -> str:
@@ -258,26 +263,76 @@ def get_status_bar_color(snapshot: Dict[str, InterfaceStats]) -> str:
     return "\033[92m"
 
 
-def framed_line(width: int = 126) -> str:
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def visible_len(text: str) -> int:
+    return len(strip_ansi(text))
+
+
+def trim_ansi_text(text: str, max_visible: int) -> str:
+    if max_visible <= 0:
+        return ""
+
+    out: List[str] = []
+    visible = 0
+    i = 0
+    n = len(text)
+
+    while i < n and visible < max_visible:
+        if text[i] == "\x1b":
+            match = ANSI_RE.match(text, i)
+            if match:
+                out.append(match.group(0))
+                i = match.end()
+                continue
+        out.append(text[i])
+        visible += 1
+        i += 1
+
+    if out and not strip_ansi("".join(out)).endswith("\033[0m"):
+        if "\033[" in "".join(out):
+            out.append("\033[0m")
+
+    return "".join(out)
+
+
+def pad_ansi_text(text: str, width: int) -> str:
+    trimmed = trim_ansi_text(text, width)
+    padding = width - visible_len(trimmed)
+    if padding > 0:
+        return trimmed + (" " * padding)
+    return trimmed
+
+
+def get_terminal_width(default: int = 126, minimum: int = 80, maximum: int = 126) -> int:
+    columns = shutil.get_terminal_size((default, 20)).columns
+    if columns < minimum:
+        return minimum
+    if columns > maximum:
+        return maximum
+    return columns
+
+
+def framed_line(width: int) -> str:
     return "┌" + "─" * (width - 2) + "┐"
 
 
-def framed_bottom(width: int = 126) -> str:
+def framed_bottom(width: int) -> str:
     return "└" + "─" * (width - 2) + "┘"
 
 
-def framed_separator(width: int = 126) -> str:
+def framed_separator(width: int) -> str:
     return "├" + "─" * (width - 2) + "┤"
 
 
-def framed_text(text: str, width: int = 126) -> str:
-    inner = width - 4
-    if len(text) > inner:
-        text = text[:inner]
-    return f"│ {text.ljust(inner)} │"
+def framed_text(text: str, width: int) -> str:
+    inner = max(width - 4, 1)
+    return f"│ {pad_ansi_text(text, inner)} │"
 
 
-def print_banner(snapshot: Dict[str, InterfaceStats], iteration: int, elapsed: float, width: int = 126) -> None:
+def print_banner(snapshot: Dict[str, InterfaceStats], iteration: int, elapsed: float, width: int) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     color = get_status_bar_color(snapshot)
     reset = "\033[0m" if color else ""
@@ -287,7 +342,7 @@ def print_banner(snapshot: Dict[str, InterfaceStats], iteration: int, elapsed: f
     print(color + framed_separator(width) + reset)
 
 
-def print_header(width: int = 126) -> None:
+def print_header(width: int) -> None:
     header = (
         f"{'IFACE':<12} {'STATE':<14} {'IPv4':<16} "
         f"{'RX RATE':>12} {'TX RATE':>12} "
@@ -299,22 +354,20 @@ def print_header(width: int = 126) -> None:
     print(framed_separator(width))
 
 
-def print_row(
+def build_row_text(
     ifname: str,
     current: InterfaceStats,
     previous: Optional[InterfaceStats],
-    elapsed: float,
-    width: int = 126
-) -> None:
+    elapsed: float
+) -> str:
     rx_rate, tx_rate, rx_pps, tx_pps = calculate_rates(current, previous, elapsed)
     ipv4 = current["ipv4"] or "-"
     state = current["operstate"]
     color = get_state_color(state)
     reset = "\033[0m" if color else ""
-
     state_field = f"{color}{state:<14}{reset}" if color else f"{state:<14}"
 
-    row = (
+    return (
         f"{ifname:<12} {state_field} {ipv4:<16} "
         f"{format_rate(rx_rate):>12} {format_rate(tx_rate):>12} "
         f"{format_pps(rx_pps):>12} {format_pps(tx_pps):>12} "
@@ -322,27 +375,22 @@ def print_row(
         f"{current['rx_drop']:>8} {current['tx_drop']:>8}"
     )
 
-    plain_prefix = f"{ifname:<12} "
-    if color:
-        visible_rest = (
-            f"{ipv4:<16} "
-            f"{format_rate(rx_rate):>12} {format_rate(tx_rate):>12} "
-            f"{format_pps(rx_pps):>12} {format_pps(tx_pps):>12} "
-            f"{current['rx_errs']:>8} {current['tx_errs']:>8} "
-            f"{current['rx_drop']:>8} {current['tx_drop']:>8}"
-        )
-        text = plain_prefix + state_field + " " + visible_rest
-    else:
-        text = row
 
-    print(framed_text(text, width))
+def print_row(
+    ifname: str,
+    current: InterfaceStats,
+    previous: Optional[InterfaceStats],
+    elapsed: float,
+    width: int
+) -> None:
+    print(framed_text(build_row_text(ifname, current, previous, elapsed), width))
 
 
-def print_footer(width: int = 126) -> None:
+def print_footer(width: int) -> None:
     print(framed_bottom(width))
 
 
-def print_details(snapshot: Dict[str, InterfaceStats], width: int = 90) -> None:
+def print_details(snapshot: Dict[str, InterfaceStats], width: int) -> None:
     print(framed_line(width))
     print(framed_text("INTERFACE DETAILS", width))
     print(framed_separator(width))
@@ -376,7 +424,7 @@ def print_details(snapshot: Dict[str, InterfaceStats], width: int = 90) -> None:
     print(framed_bottom(width))
 
 
-def print_once(snapshot: Dict[str, InterfaceStats], width: int = 126) -> None:
+def print_once(snapshot: Dict[str, InterfaceStats], width: int) -> None:
     print_banner(snapshot, iteration=0, elapsed=0.0, width=width)
     print_header(width)
     for ifname in snapshot:
@@ -469,11 +517,14 @@ def main() -> None:
         print("No network interfaces found.")
         return
 
+    table_width = get_terminal_width()
+    details_width = min(table_width, 90)
+
     previous = collect_snapshot(ifaces)
-    previous_time = time.time()
+    previous_time = time.monotonic()
 
     if args.details:
-        print_details(previous)
+        print_details(previous, width=details_width)
         if not args.once and not args.csv:
             print()
 
@@ -485,7 +536,7 @@ def main() -> None:
             for ifname in ifaces:
                 write_csv_row(writer, timestamp, ifname, previous[ifname], None, 0.0)
         else:
-            print_once(previous)
+            print_once(previous, width=table_width)
         return
 
     csv_writer = csv.writer(sys.stdout) if args.csv else None
@@ -497,7 +548,8 @@ def main() -> None:
         if not running:
             break
 
-        current_time = time.time()
+        wall_time = time.time()
+        current_time = time.monotonic()
         current = collect_snapshot(ifaces)
         elapsed = current_time - previous_time
 
@@ -505,15 +557,15 @@ def main() -> None:
             if count == 0:
                 write_csv_header(csv_writer)
             for ifname in ifaces:
-                write_csv_row(csv_writer, current_time, ifname, current[ifname], previous.get(ifname), elapsed)
+                write_csv_row(csv_writer, wall_time, ifname, current[ifname], previous.get(ifname), elapsed)
         else:
             if not args.no_header and count % args.header_every == 0:
-                print_banner(current, iteration=count + 1, elapsed=elapsed, width=126)
-                print_header(126)
+                print_banner(current, iteration=count + 1, elapsed=elapsed, width=table_width)
+                print_header(table_width)
             for ifname in ifaces:
-                print_row(ifname, current[ifname], previous.get(ifname), elapsed, 126)
+                print_row(ifname, current[ifname], previous.get(ifname), elapsed, table_width)
             if not args.no_header:
-                print_footer(126)
+                print_footer(table_width)
             else:
                 print()
 
